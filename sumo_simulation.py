@@ -23,9 +23,13 @@ CAR_COUNT = 600
 ARRIVAL_WINDOW = 1800          # seconds: departures spread over 30 minutes
 EAST_WEST_SHARE = 0.70         # probability an arrival comes from E or W
 LEFT_STRAIGHT_RIGHT = [15, 70, 15]
-TRAIN_SEED, TEST_SEED = 42, 314
+# Every design is scored on SEVERAL training traffic samples and the delays are
+# averaged, so a design cannot win by getting lucky on one sample of drivers.
+TRAIN_SEEDS = (42, 43, 44)
+TEST_SEED = 314                # fresh traffic, used only to check the final pick
 SPEED_LIMITS_KMH = {"N": 50, "E": 50, "S": 50, "W": 50}
 DRAIN_SECONDS = 3600           # extra time for the final queue to clear
+ARM_LENGTH = 400               # metres from the centre to the end of each approach road
 ARMS = "NESW"
 
 # Historical, illustrative CAD inputs; see COST_MODEL.md for sources/assumptions.
@@ -81,9 +85,14 @@ def write_json(path, data):
     Path(path).write_text(json.dumps(clean(data), indent=2, allow_nan=False), encoding="utf-8")
 
 
-def make_evaluator(folder, traffic, *, budget=None, road_cost=COST_PER_M2,
+def make_evaluator(folder, traffic_runs, *, budget=None, road_cost=COST_PER_M2,
                    arrow_cost=COST_PER_ARROW):
-    """Cached two-objective evaluation; check cost BEFORE expensive SUMO."""
+    """Cached two-objective evaluation; check cost BEFORE expensive SUMO.
+
+    traffic_runs is a list of (route_file, seed) pairs. A plan's delay is the
+    MEAN over all of them; if any sample fails (gridlock, collision), the plan
+    is infeasible.
+    """
     if budget is not None and (not math.isfinite(budget) or budget < 0):
         raise ValueError("Budget must be finite and non-negative.")
     cache = {}
@@ -97,19 +106,25 @@ def make_evaluator(folder, traffic, *, budget=None, road_cost=COST_PER_M2,
         cost = breakdown["total"]
         if budget is not None and cost > budget:
             counters["over_budget_skipped"] += 1
-            item = dict(plan=dict(plan), journey_time=math.inf, cost=cost,
+            item = dict(plan=dict(plan), delay=math.inf, cost=cost,
                         violation=cost - budget, reason="over budget", breakdown=breakdown)
         else:
             run_folder = folder / f"training_{counters['sumo_evaluations']:03d}"
             counters["sumo_evaluations"] += 1
-            result = run_simulation(plan, run_folder, traffic, TRAIN_SEED)
-            feasible = math.isfinite(result["score"])
+            results = []
+            for traffic, seed in traffic_runs:
+                results.append(run_simulation(plan, run_folder / f"seed_{seed}", traffic, seed))
+                if not math.isfinite(results[-1]["score"]):
+                    break  # one failed sample makes the plan infeasible; skip the rest
+            feasible = all(math.isfinite(r["score"]) for r in results)
             if not feasible:
                 counters["simulation_failures"] += 1
-            item = dict(plan=dict(plan), journey_time=result["score"], cost=cost,
+            delay = sum(r["score"] for r in results) / len(results) if feasible else math.inf
+            reason = next((r["reason"] for r in results if r["reason"]), "")
+            item = dict(plan=dict(plan), delay=delay, cost=cost,
                         violation=0.0 if feasible else math.inf,
-                        reason=result["reason"], breakdown=breakdown,
-                        simulation=saved_metrics(result))
+                        reason=reason, breakdown=breakdown,
+                        simulation=[saved_metrics(r) for r in results])
         cache[key] = item
         return item
 
@@ -128,12 +143,13 @@ def run_experiment(search, baseline, *, recommend, preferences, road_cost=COST_P
     for name in ("sumo", "netconvert"):
         executable(name)
     started = time.perf_counter()
-    train_traffic = make_traffic(folder / "train.rou.xml", TRAIN_SEED)
+    train_runs = [(make_traffic(folder / f"train_{seed}.rou.xml", seed), seed) for seed in TRAIN_SEEDS]
     test_traffic = make_traffic(folder / "test.rou.xml", TEST_SEED)
     budget = preferences["budget"]
     evaluate, affordable, cache, counters = make_evaluator(
-        folder, train_traffic, budget=budget, road_cost=road_cost, arrow_cost=arrow_cost)
-    print(f"{CAR_COUNT} synthetic cars; minimize mean journey time AND added infrastructure cost.")
+        folder, train_runs, budget=budget, road_cost=road_cost, arrow_cost=arrow_cost)
+    print(f"{CAR_COUNT} synthetic cars x {len(TRAIN_SEEDS)} traffic samples; "
+          "minimize mean delay per car AND added infrastructure cost.")
     print("Budget:", "none" if budget is None else f"${budget:,.2f}", "| Results:", folder, flush=True)
     outcome = search(evaluate, affordable)
     data = dict(schema_version=1, front=outcome["front"], search_budget=budget,
@@ -147,11 +163,11 @@ def run_experiment(search, baseline, *, recommend, preferences, road_cost=COST_P
     for destination in (folder, output):
         write_json(destination / "pareto_front.json", data)
         with (destination / "pareto_front.csv").open("w", newline="", encoding="utf-8") as file:
-            fields = ["id", "cost", "journey_time"] + list(baseline)
+            fields = ["id", "cost", "delay"] + list(baseline)
             writer = csv.DictWriter(file, fieldnames=fields)
             writer.writeheader()
             for i, item in enumerate(data["front"]):
-                writer.writerow(dict(id=i, cost=item["cost"], journey_time=item["journey_time"], **item["plan"]))
+                writer.writerow(dict(id=i, cost=item["cost"], delay=item["delay"], **item["plan"]))
         # Clear only the previous current-result pointers, never experiment history.
         # An unsuccessful run must not leave an old plan looking like its result.
         for name in ("best_plan.json", "recommendation.json"):
@@ -162,7 +178,7 @@ def run_experiment(search, baseline, *, recommend, preferences, road_cost=COST_P
     selected = recommend(data["front"], **preferences)
     for i, item in enumerate(data["front"]):
         mark = " <-- selected" if item is selected else ""
-        print(f"  {i:2d} | ${item['cost']:12,.2f} | {item['journey_time']:8.2f}s{mark}")
+        print(f"  {i:2d} | ${item['cost']:12,.2f} | {item['delay']:8.2f}s{mark}")
 
     # Fresh traffic is validation only, never used to re-rank the training archive.
     comparison = {}
@@ -218,14 +234,16 @@ def run_simulation(plan, folder, traffic, seed):
         arrived = int(trips.get("count"))
         collisions = int(stats.find("safety").get("collisions"))
         teleports = int(stats.find("teleports").get("total"))
-        # Travel time starts on insertion. Adding departure delay also counts
-        # cars that had to wait outside a congested network before entering.
-        seconds = float(trips.get("totalTravelTime")) + float(trips.get("totalDepartDelay"))
+        # DELAY per car = time lost compared with driving at the speed limit
+        # (SUMO's timeLoss: waiting at lights, slowing, queueing) plus time spent
+        # waiting to even enter a congested road (departDelay). Both are already
+        # per-car averages. Plain driving time, the same for every design, is excluded.
+        delay = float(trips.get("timeLoss")) + float(trips.get("departDelay"))
         if arrived != CAR_COUNT or collisions or teleports:
             score = float("inf")
             reason = f"{CAR_COUNT-arrived} unfinished; {collisions} collisions; {teleports} teleports"
         else:
-            score = seconds / CAR_COUNT
+            score = delay
             reason = ""
         result = dict(score=score, arrived=arrived, collisions=collisions,
                       teleports=teleports, reason=reason)
@@ -280,7 +298,8 @@ def saved_metrics(result):
 def experiment_settings():
     return dict(cars=CAR_COUNT, arrival_window=ARRIVAL_WINDOW, east_west_share=EAST_WEST_SHARE,
                 left_straight_right=LEFT_STRAIGHT_RIGHT, speed_limits_kmh=SPEED_LIMITS_KMH,
-                train_seed=TRAIN_SEED, test_seed=TEST_SEED, drain_seconds=DRAIN_SECONDS)
+                train_seeds=list(TRAIN_SEEDS), test_seed=TEST_SEED, drain_seconds=DRAIN_SECONDS,
+                arm_length_m=ARM_LENGTH)
 
 
 def show_simulation(config):
@@ -299,7 +318,7 @@ class InvalidDesign(ValueError):
 
 
 def build_roads(plan):
-    """Translate the 14 genes into roads, lane connections and timing settings."""
+    """Translate the 12 genes into roads, lane connections and timing settings."""
     speeds = SPEED_LIMITS_KMH
     if set(speeds) != set(ARMS) or any(not 20 <= v <= 80 for v in speeds.values()):
         raise ValueError("Provide a speed in 20..80 km/h for every origin arm")
@@ -351,7 +370,10 @@ def build_roads(plan):
         # lengths below make the added storage sum to the requested metres.
         start = pocket + 30
         gate = 150 if not pocket or abs(start - 150) >= 70 else start + 70
-        points = [(1500, arm), (gate, arm + "_gate"), (0, "centre")]
+        if max(gate, start) + 50 > ARM_LENGTH:
+            raise ValueError(f"ARM_LENGTH {ARM_LENGTH} m is too short for a {pocket} m pocket; "
+                             "lengthen the approach roads or shorten the pocket range.")
+        points = [(ARM_LENGTH, arm), (gate, arm + "_gate"), (0, "centre")]
         if pocket:
             points.append((start, arm + "_pocket"))
         points.sort(reverse=True)
@@ -448,7 +470,7 @@ def build_roads(plan):
         settings[axis] = dict(
             green=plan["green_" + axis],
             left=plan["left_green_" + axis] if plan["pocket_" + axis] else 0,
-            yellow=round(max(plan["yellow_" + axis], floor), 3),
+            yellow=round(floor, 3),  # safety rule from the speed limit, not a gene
         )
     return dict(
         nodes=nodes, roads=roads, movements=movements, signals={"centre": settings}
@@ -759,7 +781,7 @@ def main():
     folder = Path(tempfile.mkdtemp(prefix="simulation_", dir=output))
     traffic = make_traffic(folder / "traffic.rou.xml", TEST_SEED)
     result = run_simulation(plan, folder, traffic, TEST_SEED)
-    print(f"Mean journey: {result['score']:.2f}s; arrived {result['arrived']}/{CAR_COUNT}")
+    print(f"Mean delay: {result['score']:.2f}s per car; arrived {result['arrived']}/{CAR_COUNT}")
     print(result["reason"] or "Complete, without collisions or teleports.")
     print("Results:", folder)
     if args.view and (folder / "scenario.sumocfg").exists():

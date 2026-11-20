@@ -15,7 +15,7 @@ import sumo_simulation as sim
 
 
 def record(time, cost, violation=0, plan=None):
-    return dict(journey_time=time, cost=cost, violation=violation,
+    return dict(delay=time, cost=cost, violation=violation,
                 plan=ea.minimum_design() if plan is None else dict(plan))
 
 
@@ -42,17 +42,17 @@ class MultiObjectiveTests(unittest.TestCase):
         self.assertTrue(math.isinf(distances[0]))
         self.assertTrue(math.isinf(distances[3]))
         self.assertAlmostEqual(distances[1], 4 / 3)
-        scaled = [record(p['journey_time'], p['cost'] * 10000) for p in pop]
+        scaled = [record(p['delay'], p['cost'] * 10000) for p in pop]
         self.assertEqual(distances, ea.crowding_distance(scaled, list(range(4))))
         survivors = ea.select_survivors(pop, 2, random.Random(1))
-        self.assertEqual({p['journey_time'] for p in survivors}, {10, 40})
+        self.assertEqual({p['delay'] for p in survivors}, {10, 40})
         equal = [record(5, 0), record(5, 0)]
         self.assertEqual(ea.crowding_distance(equal, [0, 1]), {0: 0, 1: 0})
 
     def test_archive_removes_dominated_and_duplicate_objectives(self):
         archive = ea.update_archive([], [record(20, 50), record(10, 100)])
         archive = ea.update_archive(archive, [record(15, 40), record(15, 40), record(9, 120)])
-        self.assertEqual([(p['journey_time'], p['cost']) for p in archive], [(15, 40), (10, 100), (9, 120)])
+        self.assertEqual([(p['delay'], p['cost']) for p in archive], [(15, 40), (10, 100), (9, 120)])
 
     def test_weight_endpoints_budget_and_stable_references(self):
         front = [record(280, 100), record(245, 160), record(238, 300)]
@@ -84,12 +84,49 @@ class MultiObjectiveTests(unittest.TestCase):
     def test_full_widening_and_pocket_storage_extremes(self):
         p = ea.minimum_design()
         p['lanes_ew'] = 2
-        self.assertEqual(sim.cost_breakdown(p)['total'], 3360000)
-        for length in (12, 50, 100, 120, 155, 200, 1000):
+        # 4 directed roads x 400 m x 3.2 m x 175 CAD/m2
+        self.assertEqual(sim.cost_breakdown(p)['total'], 4 * sim.ARM_LENGTH * 3.2 * 175)
+        self.assertEqual(sim.cost_breakdown(p)['total'], 896000)
+        for length in (15, 50, 100, 120, 150):
             p.update(pocket_ns=length, pocket_ew=length)
             b = sim.cost_breakdown(p)
             self.assertAlmostEqual(b['areas_m2']['pockets'], 4 * 3.2 * length)
-            self.assertAlmostEqual(b['areas_m2']['extra_lanes'], 4 * 1500 * 3.2)
+            self.assertAlmostEqual(b['areas_m2']['extra_lanes'], 4 * sim.ARM_LENGTH * 3.2)
+        p.update(pocket_ns=1000)  # longer than the road itself: refused, not silently drawn
+        with self.assertRaises(ValueError):
+            sim.cost_breakdown(p)
+
+    def test_creep_mutation_stays_legal_and_small(self):
+        rng = random.Random(3)
+        plan = dict(ea.BASELINE)
+        for _ in range(2000):
+            child = ea.mutate(plan, rng)
+            ea.validate(child)
+            for gene in ('green_ns', 'green_ew'):
+                self.assertLessEqual(abs(child[gene] - plan[gene]), ea.CREEP_STEPS['green'])
+            for gene in ('pocket_ns', 'pocket_ew'):
+                if child[gene] and plan[gene]:
+                    self.assertLessEqual(abs(child[gene] - plan[gene]), 5 * ea.CREEP_STEPS['pocket'])
+            plan = child
+        self.assertEqual(ea.BASELINE['green_ns'], 30)  # parent dictionaries are never edited
+
+    def test_off_feature_switches_on_and_on_feature_can_switch_off(self):
+        rng = random.Random(0)
+        with patch.object(ea, 'MUTATION_PROBABILITY', 1.0):
+            off = ea.minimum_design()
+            self.assertTrue(all(ea.mutate(off, rng)['pocket_ns'] > 0 for _ in range(50)))
+            on = dict(ea.BASELINE)
+            results = {ea.mutate(on, rng)['pocket_ns'] == 0 for _ in range(200)}
+            self.assertEqual(results, {True, False})
+
+    def test_yellow_is_a_safety_rule_not_a_gene(self):
+        self.assertNotIn('yellow_ns', ea.GENE_VALUES)
+        with self.assertRaises(ValueError):
+            ea.validate({**ea.BASELINE, 'yellow_ns': 4})
+        settings = sim.build_roads(ea.BASELINE)['signals']['centre']
+        # 1 s reaction + (50 km/h = 13.89 m/s) / (2 x 3 m/s2) = 3.31 s
+        self.assertAlmostEqual(settings['ns']['yellow'], round(1 + 50 / 3.6 / 6, 3))
+        self.assertEqual(settings['ns']['yellow'], settings['ew']['yellow'])
 
     def test_bypass_shape_length_and_unit_prices(self):
         p = ea.minimum_design()
@@ -104,21 +141,27 @@ class MultiObjectiveTests(unittest.TestCase):
         self.assertGreater(sim.cost_breakdown(p)['areas_m2']['bypasses'], expected)
         self.assertEqual(sim.cost_breakdown(p, 0, 0)['total'], 0)
 
-    def test_budget_screening_cache_and_failed_simulation(self):
+    def test_budget_screening_averaging_cache_and_failed_simulation(self):
+        ok = lambda delay: dict(score=delay, arrived=600, collisions=0, teleports=0, reason='')
+        failure = dict(score=math.inf, arrived=599, collisions=1, teleports=0, reason='collision')
         with tempfile.TemporaryDirectory() as directory:
-            evaluate, _, cache, counters = sim.make_evaluator(Path(directory), Path('traffic'), budget=0)
+            runs = [(Path('traffic_a'), 1), (Path('traffic_b'), 2)]
+            evaluate, _, cache, counters = sim.make_evaluator(Path(directory), runs, budget=0)
             with patch.object(sim, 'run_simulation') as run:
                 bad_budget = evaluate(ea.BASELINE)
                 self.assertGreater(bad_budget['violation'], 0)
                 run.assert_not_called()
-                run.return_value = dict(score=250.0, arrived=600, collisions=0, teleports=0, reason='')
+                run.side_effect = [ok(20.0), ok(30.0)]
                 p = ea.minimum_design()
-                self.assertEqual(evaluate(p)['violation'], 0)
-                evaluate(dict(p))
-                self.assertEqual(run.call_count, 1)
+                item = evaluate(p)
+                self.assertEqual(item['violation'], 0)
+                self.assertEqual(item['delay'], 25.0)           # mean of the two traffic samples
+                evaluate(dict(p))                                 # cached: no new simulations
+                self.assertEqual(run.call_count, 2)
                 p['green_ns'] = 31
-                run.return_value = dict(score=math.inf, arrived=599, collisions=1, teleports=0, reason='collision')
+                run.side_effect = [failure]                       # first sample fails: stop early
                 self.assertEqual(evaluate(p)['violation'], math.inf)
+                self.assertEqual(run.call_count, 3)
                 self.assertEqual(counters, dict(sumo_evaluations=2, over_budget_skipped=1, simulation_failures=1))
                 self.assertEqual(len(cache), 3)
 
@@ -140,7 +183,7 @@ class MultiObjectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'test.json'
             sim.write_json(path, {'items': [record(math.inf, 0, math.inf)]})
-            self.assertIsNone(json.loads(path.read_text())['items'][0]['journey_time'])
+            self.assertIsNone(json.loads(path.read_text())['items'][0]['delay'])
 
     def test_no_feasible_run_saves_diagnostics_and_clears_stale_pointer(self):
         original = Path.cwd()

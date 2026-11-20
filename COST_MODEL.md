@@ -54,9 +54,10 @@ infrastructure above the reference, not that an entire intersection is free.
 - General lanes: for every directed road segment, count general lanes beyond one
   and multiply by its width and straight shape length. Include incoming AND
   outgoing segments. Segments partition each arm, so adding pocket nodes does
-  not multiply the general-lane cost. At width 3.2 m and arm length 1500 m,
-  upgrading a single axis to two general lanes costs
-  `4 * 1500 * 3.2 * 175 = 3,360,000 CAD`.
+  not multiply the general-lane cost. At width 3.2 m and arm length 400 m
+  (`ARM_LENGTH`), upgrading a single axis to two general lanes costs
+  `4 * 400 * 3.2 * 175 = 896,000 CAD`. (With the earlier 1,500 m roads this was
+  3,360,000 CAD; lane prices scale with the simulated road length.)
 - Pockets: only the added inner lane is counted. Use the explicitly specified
   storage lengths, excluding the decoder's 30 m graphical junction allowance.
   Thus `pocket_area = 2 * 3.2 * (pocket_ns + pocket_ew)`.

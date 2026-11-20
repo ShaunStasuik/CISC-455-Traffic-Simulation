@@ -1,7 +1,8 @@
 """A small, readable EA. Start with BASELINE, then read evolve().
 
-One individual is a dictionary describing an intersection.
-evaluate(plan) returns journey time, infrastructure cost and constraint status.
+One individual is a dictionary describing an intersection (12 genes).
+evaluate(plan) returns DELAY (seconds lost per car, averaged over several
+traffic samples), added infrastructure cost, and constraint status.
 NSGA-II searches both objectives; a user weight chooses a result afterwards.
 Run: python intersection_ea.py
 """
@@ -16,8 +17,10 @@ from statistics import median
 from sumo_simulation import run_experiment, write_json, COST_PER_M2, COST_PER_ARROW
 
 
-# 1. REPRESENTATION: all 14 genes are here.
+# 1. REPRESENTATION: all 12 genes are here.
 # NS values apply to both north and south. EW values apply to east and west.
+# Yellow time is NOT a gene: it is a safety rule computed from the speed limit
+# in sumo_simulation.py (otherwise the EA abuses long yellows as extra green).
 BASELINE = {
     "pocket_ns": 50,       # left-turn lane storage length, metres; 0 = absent
     "pocket_ew": 50,
@@ -31,15 +34,14 @@ BASELINE = {
     "bypass_w": False,     # west to south
     "green_ns": 30,        # main green seconds
     "green_ew": 30,
-    "yellow_ns": 4,        # requested yellow seconds (speed minimum also applies)
-    "yellow_ew": 4,
 }
 
 # Legal values. Change the ranges here when experimenting.
-# Pocket lengths and arrow times allow zero, followed by a positive range.
+# Pocket lengths and arrow times allow zero (feature off), followed by a positive range.
+# Real left-turn lanes store a handful of cars, so pockets are 15-150 m in 5 m steps.
 GENE_VALUES = {
-    "pocket_ns": [0] + list(range(12, 1001)),
-    "pocket_ew": [0] + list(range(12, 1001)),
+    "pocket_ns": [0] + list(range(15, 151, 5)),
+    "pocket_ew": [0] + list(range(15, 151, 5)),
     "left_green_ns": [0] + list(range(5, 31)),
     "left_green_ew": [0] + list(range(5, 31)),
     "lanes_ns": [1, 2],
@@ -50,21 +52,26 @@ GENE_VALUES = {
     "bypass_w": [False, True],
     "green_ns": list(range(10, 61)),
     "green_ew": list(range(10, 61)),
-    "yellow_ns": list(range(3, 7)),
-    "yellow_ew": list(range(3, 7)),
 }
 
 POPULATION_SIZE = 8
 GENERATIONS = 5
-MUTATION_PROBABILITY = 1 / 14  # independently applied to each gene
+MUTATION_PROBABILITY = 1 / len(GENE_VALUES)  # independently applied to each gene
 TOURNAMENT_SIZE = 2
 EA_SEED = 17
+
+# Creep mutation: the largest step, counted in legal values, for each numeric gene.
+# Pockets move in 5 m notches, so 3 notches = up to 15 m. Greens move up to 5 s.
+CREEP_STEPS = {"pocket": 3, "left_green": 3, "lanes": 1, "green": 5}
+# When an optional feature (pocket or arrow) is ON and mutates, this is the chance
+# it switches OFF instead of creeping. A feature that is OFF always switches ON.
+TOGGLE_PROBABILITY = 0.2
 
 
 def validate(plan):
     """Catch misspelled genes and illegal values before running SUMO."""
     if set(plan) != set(GENE_VALUES):
-        raise ValueError("A plan must contain exactly the 14 genes in BASELINE.")
+        raise ValueError(f"A plan must contain exactly the {len(GENE_VALUES)} genes in BASELINE.")
     for gene, value in plan.items():
         expected_type = bool if gene.startswith("bypass_") else int
         if type(value) is not expected_type or value not in GENE_VALUES[gene]:
@@ -102,20 +109,45 @@ def recombine(parent_a, parent_b, rng):
     return child
 
 
-# 3. MUTATION: boolean flip or numeric random reset.
+# 3. MUTATION: boolean bit-flip, numeric creep, and on/off toggle for optional features.
+def gene_kind(gene):
+    """'pocket_ns' -> 'pocket', 'left_green_ew' -> 'left_green', 'green_ns' -> 'green'."""
+    return gene.rsplit("_", 1)[0]
+
+
+def creep(gene, value, rng):
+    """Move a numeric gene a few legal values up or down, then clip (repair) to its range."""
+    values = GENE_VALUES[gene]
+    positive = values[1:] if values[0] == 0 and gene_kind(gene) in ("pocket", "left_green") else values
+    index = positive.index(value) + rng.choice([-1, 1]) * rng.randint(1, CREEP_STEPS[gene_kind(gene)])
+    return positive[max(0, min(len(positive) - 1, index))]
+
+
 def mutate(plan, rng):
-    """Return a changed copy; never edit a parent or the elite in place."""
+    """Return a changed copy; never edit a parent or the elite in place.
+
+    - Slip roads (booleans): bit-flip.
+    - Pockets and arrows (0 = off): an OFF feature switches ON at a random legal size;
+      an ON feature switches OFF with TOGGLE_PROBABILITY, otherwise it creeps.
+    - Lanes and greens: creep by a small step, so good designs can be fine-tuned.
+    """
     child = dict(plan)
     for gene in GENE_VALUES:
-        if rng.random() < MUTATION_PROBABILITY:
-            if gene.startswith("bypass_"):
-                child[gene] = not child[gene]
-            else:
-                child[gene] = random_value(gene, rng)
+        if rng.random() >= MUTATION_PROBABILITY:
+            continue
+        value = child[gene]
+        if gene.startswith("bypass_"):
+            child[gene] = not value
+        elif gene_kind(gene) in ("pocket", "left_green") and value == 0:
+            child[gene] = rng.choice(GENE_VALUES[gene][1:])
+        elif gene_kind(gene) in ("pocket", "left_green") and rng.random() < TOGGLE_PROBABILITY:
+            child[gene] = 0
+        else:
+            child[gene] = creep(gene, value, rng)
     return child
 
 
-# 4. MULTI-OBJECTIVE SELECTION: minimize journey_time AND cost.
+# 4. MULTI-OBJECTIVE SELECTION: minimize delay AND cost.
 def plan_key(plan):
     return tuple(plan[gene] for gene in GENE_VALUES)
 
@@ -130,8 +162,8 @@ def dominates(a, b):
         return a["violation"] < b["violation"]
     if a["violation"] > 0:
         return False
-    return (a["journey_time"] <= b["journey_time"] and a["cost"] <= b["cost"]
-            and (a["journey_time"] < b["journey_time"] or a["cost"] < b["cost"]))
+    return (a["delay"] <= b["delay"] and a["cost"] <= b["cost"]
+            and (a["delay"] < b["delay"] or a["cost"] < b["cost"]))
 
 
 def non_dominated_sort(population):
@@ -167,7 +199,7 @@ def crowding_distance(population, front):
     separate from the fixed reference values used for user preferences.
     """
     distance = {i: 0.0 for i in front}
-    for objective in ("journey_time", "cost"):
+    for objective in ("delay", "cost"):
         ordered = sorted(front, key=lambda i: population[i][objective])
         if not ordered:
             continue
@@ -218,12 +250,12 @@ def update_archive(archive, candidates):
     unique = {}
     for item in archive + candidates:
         if item["violation"] == 0:
-            unique.setdefault((item["journey_time"], item["cost"]), item)
+            unique.setdefault((item["delay"], item["cost"]), item)
     items = list(unique.values())
     if not items:
         return []
     front = non_dominated_sort(items)[0]
-    return sorted((items[i] for i in front), key=lambda item: (item["cost"], item["journey_time"]))
+    return sorted((items[i] for i in front), key=lambda item: (item["cost"], item["delay"]))
 
 
 def minimum_design():
@@ -254,7 +286,7 @@ def evolve(evaluate, population_size=POPULATION_SIZE, generations=GENERATIONS,
                 break
         else:
             candidate = minimum_design()
-            for gene in ("green_ns", "green_ew", "yellow_ns", "yellow_ew"):
+            for gene in ("green_ns", "green_ew"):
                 candidate[gene] = random_value(gene, rng)
         plans.append(candidate)
     population = [evaluate(plan) for plan in plans]
@@ -262,15 +294,15 @@ def evolve(evaluate, population_size=POPULATION_SIZE, generations=GENERATIONS,
     history = []
     for generation in range(generations + 1):
         feasible = [item for item in population if item["violation"] == 0]
-        times = [item["journey_time"] for item in feasible]
+        times = [item["delay"] for item in feasible]
         row = dict(generation=generation, feasible=len(feasible),
                    unique_plans=len({plan_key(item["plan"]) for item in population}),
-                   best_journey=min(times) if times else None,
-                   median_journey=median(times) if times else None,
+                   best_delay=min(times) if times else None,
+                   median_delay=median(times) if times else None,
                    archive_size=len(archive))
         history.append(row)
-        best = f"{row['best_journey']:.2f}s" if times else "none"
-        print(f"Generation {generation:2d} | fastest feasible {best}"
+        best = f"{row['best_delay']:.2f}s" if times else "none"
+        print(f"Generation {generation:2d} | lowest delay {best}"
               f" | feasible {len(feasible)}/{population_size}"
               f" | unique {row['unique_plans']} | trade-offs {len(archive)}", flush=True)
         if generation == generations:
@@ -287,13 +319,19 @@ def evolve(evaluate, population_size=POPULATION_SIZE, generations=GENERATIONS,
 
 
 # 6. USER DECISION. Weight is NOT used in NSGA-II ranking or variation.
-def preference_score(item, cost_weight=0.5, time_reference=20.0, cost_reference=500_000.0):
-    return ((1 - cost_weight) * item["journey_time"] / time_reference
+# Fixed scales that turn seconds and dollars into comparable numbers for the preference.
+# 60 s of delay per car and $1,000,000 of construction each count as "1.0".
+TIME_REFERENCE = 60.0
+COST_REFERENCE = 1_000_000.0
+
+
+def preference_score(item, cost_weight=0.5, time_reference=TIME_REFERENCE, cost_reference=COST_REFERENCE):
+    return ((1 - cost_weight) * item["delay"] / time_reference
             + cost_weight * item["cost"] / cost_reference)
 
 
 def recommend(front, *, cost_weight=0.5, budget=None,
-              time_reference=300.0, cost_reference=1_000_000.0):
+              time_reference=TIME_REFERENCE, cost_reference=COST_REFERENCE):
     if not math.isfinite(cost_weight) or not 0 <= cost_weight <= 1:
         raise ValueError("Cost weight must be finite and in [0, 1].")
     if any(not math.isfinite(v) or v <= 0 for v in (time_reference, cost_reference)):
@@ -307,11 +345,11 @@ def recommend(front, *, cost_weight=0.5, budget=None,
     # Tie-break by the other objective at either endpoint; deterministic otherwise.
     return min(eligible, key=lambda item: (
         preference_score(item, cost_weight, time_reference, cost_reference),
-        item["cost"], item["journey_time"], plan_key(item["plan"])))
+        item["cost"], item["delay"], plan_key(item["plan"])))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="14-gene NSGA-II: journey time and infrastructure cost")
+    parser = argparse.ArgumentParser(description="12-gene NSGA-II: delay per car and infrastructure cost")
     parser.add_argument("--population", type=int, default=POPULATION_SIZE)
     parser.add_argument("--generations", type=int, default=GENERATIONS)
     parser.add_argument("--seed", type=int, default=EA_SEED)
@@ -320,7 +358,7 @@ def main():
     parser.add_argument("--budget", type=float, help="Hard cap on ADDED infrastructure cost; omit for no cap")
     parser.add_argument("--road-cost", type=float, default=None, help=f"CAD/m2 (default {COST_PER_M2})")
     parser.add_argument("--arrow-cost", type=float, default=None, help=f"CAD/approach (default {COST_PER_ARROW})")
-    parser.add_argument("--time-reference", type=float, help="Fixed time scale: default 300 seconds; re-ranking inherits saved value")
+    parser.add_argument("--time-reference", type=float, help="Fixed delay scale: default 60 seconds; re-ranking inherits saved value")
     parser.add_argument("--cost-reference", type=float, help="Fixed cost scale: default 1000000 CAD; re-ranking inherits saved value")
     parser.add_argument("--select-from", type=Path, help="Re-rank saved pareto_front.json without SUMO")
     parser.add_argument("--view", action="store_true", help="Watch selected design after a new search")
@@ -328,10 +366,10 @@ def main():
     if args.population < 3 or args.generations < 0:
         parser.error("Use population >= 3 and generations >= 0.")
     preference = dict(cost_weight=args.cost_weight, budget=args.budget,
-                      time_reference=300.0 if args.time_reference is None else args.time_reference,
-                      cost_reference=1_000_000.0 if args.cost_reference is None else args.cost_reference)
+                      time_reference=TIME_REFERENCE if args.time_reference is None else args.time_reference,
+                      cost_reference=COST_REFERENCE if args.cost_reference is None else args.cost_reference)
     # Validate settings before starting SUMO, even if the resulting archive is empty.
-    dummy = dict(plan=minimum_design(), violation=0, cost=0, journey_time=1)
+    dummy = dict(plan=minimum_design(), violation=0, cost=0, delay=1)
     try:
         recommend([dummy], **preference)
         for value in (args.road_cost, args.arrow_cost):
@@ -357,7 +395,7 @@ def main():
                 score=preference_score(selected, args.cost_weight, preference["time_reference"], preference["cost_reference"]),
                 source_archive=str(args.select_from.resolve()),
                 note="Chosen using training results. Re-ranking does not run fresh validation."))
-            print(f"Selected ${selected['cost']:,.2f}, {selected['journey_time']:.2f}s (training).")
+            print(f"Selected ${selected['cost']:,.2f}, {selected['delay']:.2f}s (training).")
             print("Saved:", destination / "best_plan.json")
             print("Only designs in this archive were considered; raising the cap cannot recover unexplored designs.")
             return
