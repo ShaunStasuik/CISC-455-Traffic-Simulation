@@ -1,3 +1,7 @@
+> **Note (Tirths-branch):** everything below describes runs of the earlier
+> `updated_code-1` version (14 genes, journey time, 1,500 m roads). Results for
+> this branch are being produced with `experiments.py` and will replace this file.
+
 # Validation of cost, NSGA-II, preference and budget update
 
 Validation performed 2026-11-19 with Python 3 and eclipse-sumo 1.28.0.
