@@ -4,8 +4,8 @@ Each experiment changes ONE setting, runs the EA with several EA seeds, and is
 compared with pure random search given the same number of designs. Results go
 to experiments/ as a CSV per run plus two charts (needs matplotlib).
 
-Quick check (about 5 minutes):  python experiments.py --quick
-Full set (about 20-30 minutes):  python experiments.py
+Quick check (about 15 minutes on 2 cores):  python experiments.py --quick
+Full set (about 35 minutes on 2 cores):     python experiments.py
 """
 import argparse
 import contextlib

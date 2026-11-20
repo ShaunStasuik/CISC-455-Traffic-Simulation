@@ -1,73 +1,95 @@
-> **Note (Tirths-branch):** everything below describes runs of the earlier
-> `updated_code-1` version (14 genes, journey time, 1,500 m roads). Results for
-> this branch are being produced with `experiments.py` and will replace this file.
+# Validation and experiment results (Tirths-branch)
 
-# Validation of cost, NSGA-II, preference and budget update
+Run on 2026-11-20 with Python 3.13 and eclipse-sumo 1.28.0. These checks show the
+prototype works and how the EA behaves. They are not proof of global optimality
+or of real-world engineering validity.
 
-Validation performed 2026-11-19 with Python 3 and eclipse-sumo 1.28.0.
-The original 14 genes, road geometry, signal decoder and random-reset mutation
-were retained. These checks establish prototype correctness, not engineering
-validity, statistical superiority, or optimality.
+## 1. Automated tests
 
-## Automated checks
+```sh
+python -m unittest -v test_multiobjective
+```
 
-`python -m unittest -v test_multiobjective`
+15 tests pass in under a second (no SUMO needed). They cover Pareto dominance and
+sorting, constraint priority, crowding distance, survivor selection, the archive,
+preference endpoints and budgets, cost examples, dormant arrows, lane widening on
+400 m roads, refusal of pockets that do not fit, creep mutation staying legal and
+small, features switching on/off, yellow being a rule rather than a gene,
+averaging over traffic samples with caching, and failure handling.
 
-12 deterministic tests cover known Pareto fronts, equality, feasibility priority,
-crowding normalization/endpoints, survivor truncation, archive maintenance,
-preference endpoints, exact budget boundaries, invalid settings, worked cost
-examples, dormant arrows, complete incoming/outgoing widening, pocket extremes,
-bypass geometry costs, zero-price handling, pre-SUMO budget screening, caching,
-failed simulations, zero-budget evolution, strict JSON, and failure output.
+## 2. Reference designs
 
-CLI checks additionally exercised saved-archive selection with weights 0 and 1,
-filtering at 250,000 CAD, saved-reference inheritance, and rejection of negative
-budgets/prices, NaN weights, out-of-range weights, zero references and re-ranking
-with new unit-price overrides. Re-ranking ran without a SUMO runtime on its path.
+Delay = seconds lost per car (`timeLoss + departDelay`). Training = mean of traffic
+seeds 42, 43, 44. Fresh = unseen traffic seed 314.
 
-## Real SUMO runs
+| Design | Added cost | Training delay | Fresh delay |
+|---|---:|---:|---:|
+| Baseline (50 m pockets, 8 s arrows, 30/30 greens) | $172,000 | 52.8 s | 51.6 s |
+| Do-nothing (no pockets, no arrows, 30/30 greens) | $0 | 30.0 s | 35.7 s |
 
-All runs used 600 cars, 1800 s arrival window, default 70% E/W traffic, training
-seed 42 and fresh-traffic seed 314. Unit costs were 175 CAD/m2 and 15,000
-CAD/approach. Cost references were 1,000,000 CAD and 300 seconds.
+The baseline is worse than doing nothing: its protected left arrows add four
+extra phases and lengthen the cycle. The same design's delay varies between
+traffic samples (do-nothing: 27.6 / 36.1 / 26.5 s), which is why designs are
+averaged over three samples.
 
-- Unconstrained: population 8, five reproduction generations, EA seed 17,
-  preference weight 0.1, no budget.
-- Budget 250000: population 6, three reproduction generations, EA seed 17,
-  preference weight 0.5, budget 250,000 CAD.
-- Zero budget: population 3, one reproduction generation, EA seed 17,
-  preference weight 0.5, budget 0 CAD.
+## 3. Behaviour experiments
 
-| Run | Archive designs | Training SUMO runs | Budget skips | Infeasible simulations | Selected cost CAD | Training seconds | Fresh seconds |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| unconstrained | 8 | 43 | 0 | 0 | 0.00 | 252.5286 | 255.4573 |
-| budget_250000 | 2 | 14 | 3 | 1 | 0.00 | 268.6909 | 272.2676 |
-| zero_budget | 1 | 3 | 2 | 0 | 0.00 | 260.9939 | 262.0536 |
+`python experiments.py`: each experiment changes one setting; 5 EA seeds each;
+random search gets the same number of designs as the default EA with the same
+seed. 1,979 s on 2 CPU cores.
 
-All selected designs and the baseline completed 600/600 fresh-traffic trips
-without collisions or teleports. Every archived design was checked to be
-training-feasible, within its budget, and not dominated by another archive entry.
-The baseline fresh-traffic mean journey was 295.53395 seconds in each run.
+| Experiment | Lowest delay found (mean of 5) | Hypervolume (mean of 5) | Designs per run | Pick at weight 0.5: cost / fresh delay (mean) |
+|---|---:|---:|---:|---:|
+| A defaults (population 8, 5 generations, mutation 1/12, tournament 2) | 16.6 s | 0.703 | 43 | $16,800 / 27.8 s |
+| B random search (same number of designs) | 15.1 s | 0.668 | 43 | $0 / 35.7 s |
+| C bigger budget (population 16, 10 generations) | **13.9 s** | **0.752** | 156 | $31,360 / **19.6 s** |
+| D mutation 0.25 | 14.7 s | 0.723 | 47 | $48,438 / 25.8 s |
+| E tournament size 4 | 15.9 s | 0.713 | 40 | $57,120 / 23.8 s |
 
-The unrestricted archive spans zero added cost (252.53 s) to 4,818,610.28 CAD
-(236.40 s). Saved-archive re-ranking selected the fastest endpoint at weight 0,
-the cheapest endpoint at weight 1, and 204,960 CAD / 248.99 s at weight 0 with
-a 250,000 CAD filter. These re-ranked alternatives were NOT all freshly validated.
+Hypervolume = share of the box delay 0–60 s × cost $0–3M that a run's trade-off
+curve covers (higher = cheaper-and-faster designs found across the range).
+Charts: `figures/summary.png` (every run as a dot) and `figures/fronts.png`
+(trade-off curves of A, B and C). Raw numbers: `figures/runs.csv`.
 
-The budget-250000 run encountered one infeasible simulation, which was excluded.
-The pre-existing bypass/merge model can produce collision failures; this update
-does not resolve that modelling limitation. Passing selected designs does not
-prove every generated network is valid.
+## 4. What the results say
 
-Compact archives, CSVs and initial recommendation reports are in `sample_results/`.
-The example plan is the selected design from the unconstrained run. No full SUMO
-run folders, absolute-path replay files, caches or installed binaries are shipped.
+- **Evolution beats random search on the trade-off, not on the single fastest
+  design.** The EA's hypervolume was higher in 4 of 5 paired seeds (0.703 vs
+  0.668). Random search sometimes stumbles on a very fast but expensive design
+  (lowest delay 15.1 s vs 16.6 s), but it never found cheap improvements: its
+  recommended design was the $0 do-nothing plan in all 5 runs (35.7 s fresh).
+  The EA's recommendations cost about $17k and cut fresh delay to 27.8 s on average.
+- **More search is better and more consistent.** Population 16 × 10 generations
+  gave the best results on every measure (13.9 s lowest delay, hypervolume 0.752,
+  recommended design 19.6 s fresh for about $31k), at about 3.5x the simulations.
+- **More mutation helped with creep mutation.** Mutation 0.25 raised hypervolume
+  from 0.703 to 0.723. (In the earlier version with random-reset mutation, the
+  same change made no difference.)
+- **Tournament size 4 made little difference** (0.713 vs 0.703); with 5 seeds
+  and this spread, that is not a clear effect.
+- **Luck still matters at the default budget.** Lowest delay with the defaults
+  ranged from 12.6 s to 18.1 s across seeds; report several seeds.
+- **The cost curve is now continuous.** With 400 m roads, widening one axis
+  costs $896,000 instead of $3.36M, so the trade-off curves fill the $0–2.5M
+  range rather than jumping from $0 to $3.36M.
+- **Training results hold on fresh traffic.** Recommended designs were usually
+  within about 1–6 s of their training delay on the unseen traffic sample.
+- **Some designs are infeasible.** 0–6 designs per run produced collisions or
+  unfinished cars (mostly slip-road merges) and were rejected.
+
+## 5. Comparison with the earlier version (updated_code-1)
+
+The earlier version scored journey time on 1,500 m roads (about 216 s of every
+journey was plain driving), so its numbers are not directly comparable. The same
+style of experiment on it showed: the EA beat random search on hypervolume
+(0.666 vs 0.575), random-reset mutation 0.25 changed nothing, the cost curve
+jumped from about $0.4M straight to $3.36M, and the recommended design at weight
+0.5 was almost always the $0 one. With this branch, recommendations are real
+low-cost designs, the cost curve is continuous, and mutation rate now matters.
 
 ## Limits
 
-Only three small smoke searches were performed, not a multi-seed comparative
-study. A small archive is not the entire Pareto front. Timing/traffic assumptions,
-collision handling and the cost omissions in COST_MODEL.md remain limitations.
-GUI playback was not manually inspected. Unit prices are historical modelling
-proxies, not quotations. Both normalization scales and unit prices affect final
-recommendations and should be documented in any experiment.
+Five seeds per experiment is a small sample. Traffic is synthetic. Costs are
+illustrative (`COST_MODEL.md`). Slip-road merge collisions are rejected, not
+fixed. Only the recommended design and the baseline are checked on fresh traffic;
+the whole front is not.

@@ -34,7 +34,7 @@ python -m pip install -r requirements.txt
 python -m unittest -v test_multiobjective          # 15 checks, no SUMO needed, < 1 s
 python intersection_ea.py                           # one search, about 1.5 minutes
 python intersection_ea.py --population 16 --generations 10 --budget 250000 --cost-weight 0.5
-python experiments.py --quick                       # behaviour experiments, about 10 minutes
+python experiments.py --quick                       # behaviour experiments, about 15 minutes
 ```
 
 On Windows, `py` can replace `python`. SUMO 1.28.0 is installed by pip; an
@@ -105,7 +105,7 @@ python intersection_ea.py --select-from results/pareto_front.json --cost-weight 
 setting at a time: A defaults (population 8, 5 generations), B random search with
 the same number of designs, C bigger budget (16 × 10), D mutation 0.25, E
 tournament 4. It writes `experiments/runs.csv`, `experiments/summary.png`
-(lowest delay and hypervolume per run) and `experiments/fronts.png`. Hypervolume
+(lowest delay and hypervolume per run) and `experiments/fronts.png` (about 35 minutes on 2 cores). Hypervolume
 is the share of the box delay 0–60 s × cost $0–3M covered by a run's trade-off
 curve; higher means cheaper-and-faster designs were found across the range.
 Results from this branch are in `VALIDATION.md`.
