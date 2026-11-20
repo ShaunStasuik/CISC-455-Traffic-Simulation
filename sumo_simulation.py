@@ -1,314 +1,770 @@
-"""SUMO side of the intersection experiment. Run signal_timing_ea.py.
+"""All SUMO work lives here. The evolutionary algorithm lives in intersection_ea.py.
 
-build_network turns a Design's layout genes (control type, lanes, turning lanes,
-right-turn pockets) into a SUMO network; write_signal turns its timer genes into
-a signal program; score runs traffic and returns mean delay per car.
+Read run_experiment() first, then run_simulation(). Geometry/XML helpers follow.
+Run a saved design separately: python sumo_simulation.py --plan results/best_plan.json
+Add --view to watch it. Without --plan, this file runs the baseline only.
 """
-from functools import lru_cache
+
+import argparse
+import csv
+import time
+import json
 import math
+import os
 from pathlib import Path
 import random
 import shutil
 import subprocess
-from tempfile import TemporaryDirectory
-from typing import NamedTuple
+import tempfile
 import xml.etree.ElementTree as ET
 
-from intersection_design import (ARMS, POCKET_LENGTH, SPEED_LIMIT, cost_breakdown,
-                                 describe, total_cost, value_score)
-
-
-CAR_COUNT = 800
-ARRIVAL_WINDOW = 1800       # 30 minutes of scheduled departures
-EAST_WEST_SHARE = 0.70      # try 0.30 and see whether the design changes
+# Experiment inputs, not genes. All candidates face the same synthetic traffic.
+CAR_COUNT = 600
+ARRIVAL_WINDOW = 1800          # seconds: departures spread over 30 minutes
+EAST_WEST_SHARE = 0.70         # probability an arrival comes from E or W
+LEFT_STRAIGHT_RIGHT = [15, 70, 15]
 TRAIN_SEED, TEST_SEED = 42, 314
-ARM_LENGTH = 220            # metres from the junction to the end of each arm
-ROUNDABOUT_RADIUS = 25
-HEADING = {"N": (0, 1), "E": (1, 0), "S": (0, -1), "W": (-1, 0)}
-TURNS = {1: "left", 2: "straight", 3: "right"}   # clockwise steps from approach to exit
+SPEED_LIMITS_KMH = {"N": 50, "E": 50, "S": 50, "W": 50}
+DRAIN_SECONDS = 3600           # extra time for the final queue to clear
+ARMS = "NESW"
+
+# Historical, illustrative CAD inputs; see COST_MODEL.md for sources/assumptions.
+COST_PER_M2 = 175.0
+COST_PER_ARROW = 15_000.0
 
 
-class Segment(NamedTuple):
-    edge: str
-    start: float        # distance from the junction where this piece of road begins
-    left: bool          # carries the left-turn lane
-    pocket: bool        # carries the right-turn pocket
+def cost_breakdown(plan, road_cost=COST_PER_M2, arrow_cost=COST_PER_ARROW):
+    """Cost above one general lane/direction, no pockets/bypasses/left arrows.
 
-
-def write_xml(root, path):
-    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
-
-
-def axis(arm):
-    return "NS" if arm in "NS" else "EW"
-
-
-def lanes_on(design, arm):
-    return design.ns_lanes if arm in "NS" else design.ew_lanes
-
-
-def exit_arm(approach, turn):
-    return ARMS[(ARMS.index(approach) + turn) % len(ARMS)]
-
-
-def point(arm, distance):
-    dx, dy = HEADING[arm]
-    return {"x": f"{dx * distance:.2f}", "y": f"{dy * distance:.2f}"}
-
-
-def layout_key(design):
-    """Genes that change the road itself. Designs sharing these share one network."""
-    return (design.control, design.ns_lanes, design.ew_lanes,
-            design.turn_lane_m, design.right_pockets)
-
-
-def lane_roles(through, left, pocket):
-    """SUMO numbers lanes from the kerb: pocket, then through lanes, then the left-turn lane."""
-    return ["pocket"] * pocket + ["through"] * through + ["left"] * left
-
-
-def approach_segments(design, arm):
-    """Cut the approach wherever a turning lane or pocket begins, listed far to near."""
-    pocket = design.right_pockets[ARMS.index(arm)]
-    starts = {ARM_LENGTH}
-    if design.turn_lane_m:
-        starts.add(design.turn_lane_m)
-    if pocket:
-        starts.add(POCKET_LENGTH)
-    return [Segment(arm + "_in" + (f"_{i}" if i else ""), start,
-                    design.turn_lane_m >= start, pocket and POCKET_LENGTH >= start)
-            for i, start in enumerate(sorted(starts, reverse=True))]
-
-
-def connect(connections, from_edge, to_edge, from_lane, to_lane):
-    ET.SubElement(connections, "connection", {"from": from_edge, "to": to_edge,
-                                              "fromLane": str(from_lane), "toLane": str(to_lane)})
-
-
-def join_segments(connections, near, far, through):
-    """Feed every lane of the nearer segment; new bays branch off the lane beside them."""
-    far_roles = lane_roles(through, far.left, far.pocket)
-    for lane, role in enumerate(lane_roles(through, near.left, near.pocket)):
-        if role == "through":
-            source = far_roles.index("through") + lane - near.pocket
-        elif role in far_roles:
-            source = far_roles.index(role)
-        elif role == "pocket":
-            source = far_roles.index("through")                     # kerb-side through lane
+    This is a lane-area proxy, not a surveyed pavement footprint. General
+    widening uses road-shape lengths in both directions. Added pocket storage
+    uses explicit simulated lengths (excludes the 30 m drawing allowance).
+    Bypasses use their complete polyline lengths, including relocated gates.
+    """
+    if any(not math.isfinite(v) or v < 0 for v in (road_cost, arrow_cost)):
+        raise ValueError("Unit costs must be finite and non-negative.")
+    graph = build_roads(plan)
+    areas = dict(extra_lanes=0.0, pockets=0.0, bypasses=0.0)
+    for name, road in graph["roads"].items():
+        shape = road["shape"]
+        length = sum(math.dist(a, b) for a, b in zip(shape, shape[1:]))
+        width = road["width"]
+        if name.endswith("_bypass"):
+            areas["bypasses"] += length * width * road["lanes"]
         else:
-            source = len(far_roles) - 1 - far_roles[::-1].index("through")  # inner through lane
-        connect(connections, far.edge, near.edge, source, lane)
+            axis = "ns" if road["arm"] in "NS" else "ew"
+            general_lanes = plan["lanes_" + axis]
+            areas["extra_lanes"] += length * width * (general_lanes - 1)
+            pocket_lanes = road["lanes"] - general_lanes
+            areas["pockets"] += road.get("length", length) * width * pocket_lanes
+    approaches = sum(2 for axis in ("ns", "ew")
+                     if graph["signals"]["centre"][axis]["left"] > 0)
+    costs = {name: round(area * road_cost, 2) for name, area in areas.items()}
+    costs["left_arrow_equipment"] = round(approaches * arrow_cost, 2)
+    if not math.isfinite(sum(costs.values())):
+        raise ValueError("Unit costs are too large to calculate a finite total.")
+    return dict(areas_m2=areas, protected_left_approaches=approaches,
+                unit_costs=dict(road_per_m2=road_cost, arrow_per_approach=arrow_cost),
+                costs=costs, total=round(sum(costs.values()), 2))
 
 
-def turn_connections(connections, design, arm, last):
-    """Pin each movement to its lanes, so bays only serve their own turn."""
-    through = lanes_on(design, arm)
-    roles = lane_roles(through, last.left, last.pocket)
-    for turn, move in TURNS.items():
-        target = exit_arm(arm, turn)
-        if move == "straight":
-            first = roles.index("through")
-            pairs = [(first + k, k) for k in range(through)]
-        elif move == "right":
-            pairs = [(0, 0)]                                    # kerb lane: pocket if any
+def write_json(path, data):
+    """Save portable JSON, replacing non-finite diagnostics with null."""
+    def clean(value):
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(item) for item in value]
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+    Path(path).write_text(json.dumps(clean(data), indent=2, allow_nan=False), encoding="utf-8")
+
+
+def make_evaluator(folder, traffic, *, budget=None, road_cost=COST_PER_M2,
+                   arrow_cost=COST_PER_ARROW):
+    """Cached two-objective evaluation; check cost BEFORE expensive SUMO."""
+    if budget is not None and (not math.isfinite(budget) or budget < 0):
+        raise ValueError("Budget must be finite and non-negative.")
+    cache = {}
+    counters = dict(sumo_evaluations=0, over_budget_skipped=0, simulation_failures=0)
+
+    def evaluate(plan):
+        key = tuple(sorted(plan.items()))
+        if key in cache:
+            return cache[key]
+        breakdown = cost_breakdown(plan, road_cost, arrow_cost)
+        cost = breakdown["total"]
+        if budget is not None and cost > budget:
+            counters["over_budget_skipped"] += 1
+            item = dict(plan=dict(plan), journey_time=math.inf, cost=cost,
+                        violation=cost - budget, reason="over budget", breakdown=breakdown)
         else:
-            pairs = [(len(roles) - 1, lanes_on(design, target) - 1)]  # inner lane: bay if any
-        for from_lane, to_lane in pairs:
-            connect(connections, last.edge, target + "_out", from_lane, to_lane)
+            run_folder = folder / f"training_{counters['sumo_evaluations']:03d}"
+            counters["sumo_evaluations"] += 1
+            result = run_simulation(plan, run_folder, traffic, TRAIN_SEED)
+            feasible = math.isfinite(result["score"])
+            if not feasible:
+                counters["simulation_failures"] += 1
+            item = dict(plan=dict(plan), journey_time=result["score"], cost=cost,
+                        violation=0.0 if feasible else math.inf,
+                        reason=result["reason"], breakdown=breakdown,
+                        simulation=saved_metrics(result))
+        cache[key] = item
+        return item
+
+    def within_budget(plan):
+        return budget is None or cost_breakdown(plan, road_cost, arrow_cost)["total"] <= budget
+
+    return evaluate, within_budget, cache, counters
 
 
-def add_roundabout(nodes, edges, lanes):
-    """Four ring nodes joined counter-clockwise, as traffic circulates in Canada."""
-    order = "NWSE"
-    for arm in order:
-        ET.SubElement(nodes, "node", id="r" + arm, type="priority",
-                      **point(arm, ROUNDABOUT_RADIUS))
-    ring = []
-    for a, b in zip(order, order[1:] + order[0]):
-        (ax, ay), (bx, by) = HEADING[a], HEADING[b]
-        mx, my = (ax + bx) / math.sqrt(2), (ay + by) / math.sqrt(2)   # 45 degrees between
-        r = ROUNDABOUT_RADIUS
-        shape = f"{ax * r},{ay * r} {mx * r:.2f},{my * r:.2f} {bx * r},{by * r}"
-        ring.append(f"ring_{a}{b}")
-        ET.SubElement(edges, "edge", {"id": ring[-1], "from": "r" + a, "to": "r" + b,
-                                      "numLanes": str(lanes), "speed": "8.3", "shape": shape})
-    ET.SubElement(edges, "roundabout", nodes=" ".join("r" + a for a in order),
-                  edges=" ".join(ring))
+def run_experiment(search, baseline, *, recommend, preferences, road_cost=COST_PER_M2,
+                   arrow_cost=COST_PER_ARROW, ea_settings=None, view=False):
+    """Search, save the Pareto archive, choose by weight, then validate selection."""
+    output = Path("results").resolve()
+    output.mkdir(exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="experiment_", dir=output))
+    for name in ("sumo", "netconvert"):
+        executable(name)
+    started = time.perf_counter()
+    train_traffic = make_traffic(folder / "train.rou.xml", TRAIN_SEED)
+    test_traffic = make_traffic(folder / "test.rou.xml", TEST_SEED)
+    budget = preferences["budget"]
+    evaluate, affordable, cache, counters = make_evaluator(
+        folder, train_traffic, budget=budget, road_cost=road_cost, arrow_cost=arrow_cost)
+    print(f"{CAR_COUNT} synthetic cars; minimize mean journey time AND added infrastructure cost.")
+    print("Budget:", "none" if budget is None else f"${budget:,.2f}", "| Results:", folder, flush=True)
+    outcome = search(evaluate, affordable)
+    data = dict(schema_version=1, front=outcome["front"], search_budget=budget,
+                cost_model=dict(road_per_m2=road_cost, arrow_per_approach=arrow_cost,
+                                basis="Illustrative historical CAD; incremental infrastructure above minimum design"),
+                settings=experiment_settings(), ea_settings=ea_settings,
+                normalization={key: preferences[key] for key in ("time_reference", "cost_reference")},
+                history=outcome["history"], counters=counters,
+                search_seconds=time.perf_counter() - started)
+    write_json(folder / "evaluations.json", list(cache.values()))
+    for destination in (folder, output):
+        write_json(destination / "pareto_front.json", data)
+        with (destination / "pareto_front.csv").open("w", newline="", encoding="utf-8") as file:
+            fields = ["id", "cost", "journey_time"] + list(baseline)
+            writer = csv.DictWriter(file, fieldnames=fields)
+            writer.writeheader()
+            for i, item in enumerate(data["front"]):
+                writer.writerow(dict(id=i, cost=item["cost"], journey_time=item["journey_time"], **item["plan"]))
+        # Clear only the previous current-result pointers, never experiment history.
+        # An unsuccessful run must not leave an old plan looking like its result.
+        for name in ("best_plan.json", "recommendation.json"):
+            (destination / name).unlink(missing_ok=True)
+    if not data["front"]:
+        raise RuntimeError(f"No feasible design discovered under this budget; diagnostics saved in {folder}. "
+                           "This is not proof that no feasible design exists.")
+    selected = recommend(data["front"], **preferences)
+    for i, item in enumerate(data["front"]):
+        mark = " <-- selected" if item is selected else ""
+        print(f"  {i:2d} | ${item['cost']:12,.2f} | {item['journey_time']:8.2f}s{mark}")
+
+    # Fresh traffic is validation only, never used to re-rank the training archive.
+    comparison = {}
+    for label, plan in (("Baseline", baseline), ("Selected", selected["plan"])):
+        test = run_simulation(plan, folder / label.lower(), test_traffic, TEST_SEED)
+        breakdown = cost_breakdown(plan, road_cost, arrow_cost)
+        comparison[label] = dict(genes=plan, cost=breakdown["total"],
+                                 within_budget=budget is None or breakdown["total"] <= budget,
+                                 fresh_traffic=saved_metrics(test))
+        print(f"{label:10s} | fresh traffic {test['score']:.2f}s | {test['arrived']}/{CAR_COUNT} arrived"
+              f" | {test['reason'] or 'complete'}", flush=True)
+    if comparison["Selected"]["fresh_traffic"]["score"] is None:
+        print("WARNING: selected training design failed fresh-traffic validation; inspect comparison.json.")
+    report = dict(preferences=preferences, selected=selected, comparison=comparison,
+                  counters=counters, source_archive=str(folder / "pareto_front.json"),
+                  note="Preference uses training results; only baseline and selected design receive fresh-traffic validation.")
+    for destination in (folder, output):
+        write_json(destination / "best_plan.json", selected["plan"])
+        write_json(destination / "recommendation.json", report)
+    write_json(folder / "comparison.json", report)
+    print("Training evaluations:", counters)
+    print("Saved selected plan:", output / "best_plan.json")
+    if view and (folder / "selected" / "scenario.sumocfg").exists():
+        show_simulation(folder / "selected" / "scenario.sumocfg")
+    return selected["plan"]
 
 
-def build_network(folder, design):
-    """Compile one layout. Return {link index: (axis, movement)} for a signal, else None."""
-    nodes, edges, connections = (ET.Element(tag) for tag in ("nodes", "edges", "connections"))
-    roundabout = design.control == "roundabout"
-    if roundabout:
-        add_roundabout(nodes, edges, max(design.ns_lanes, design.ew_lanes))
+
+def run_simulation(plan, folder, traffic, seed):
+    """Build one design, run SUMO, and measure all scheduled cars.
+
+    This is the boundary between the EA and SUMO. It does no selection,
+    recombination or mutation. It only evaluates the plan it was given.
+    """
+    folder = Path(folder).resolve()
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        graph = build_roads(plan)
+        network = compile_network(graph, folder, executable("netconvert"))
+        signal = write_signals(graph, network, folder)
+    except InvalidDesign as error:
+        result = dict(score=float("inf"), arrived=0, collisions=0, teleports=0,
+                      reason=str(error))
     else:
-        node_type = {"stop": "allway_stop", "signal": "traffic_light"}[design.control]
-        ET.SubElement(nodes, "node", id="centre", x="0", y="0", type=node_type)
+        config = write_configuration(network, signal, traffic, seed, folder)
+        run_program([
+            executable("sumo"), "-c", str(config), "--no-step-log",
+            "--duration-log.statistics", "--statistic-output", str(folder / "statistics.xml"),
+        ], folder / "simulation.log")
 
-    for arm in ARMS:
-        lanes = lanes_on(design, arm)
-        junction = "r" + arm if roundabout else "centre"
-        ET.SubElement(nodes, "node", id=arm, **point(arm, ARM_LENGTH))
-        segments = approach_segments(design, arm)
-        for i, seg in enumerate(segments):
-            start = arm if i == 0 else f"{arm}{seg.start}"
-            end = f"{arm}{segments[i + 1].start}" if i + 1 < len(segments) else junction
-            if i:
-                ET.SubElement(nodes, "node", id=start, type="priority", **point(arm, seg.start))
-                join_segments(connections, seg, segments[i - 1], lanes)
-            ET.SubElement(edges, "edge", {"id": seg.edge, "from": start, "to": end,
-                                          "numLanes": str(lanes + seg.left + seg.pocket),
-                                          "speed": str(SPEED_LIMIT)})
-        ET.SubElement(edges, "edge", {"id": arm + "_out", "from": junction, "to": arm,
-                                      "numLanes": str(lanes), "speed": str(SPEED_LIMIT)})
-        if not roundabout:
-            turn_connections(connections, design, arm, segments[-1])
-
-    write_xml(nodes, folder / "nodes.xml")
-    write_xml(edges, folder / "roads.xml")
-    write_xml(connections, folder / "lanes.xml")
-    subprocess.run(["netconvert", "-n", "nodes.xml", "-e", "roads.xml", "-x", "lanes.xml",
-                    "--no-turnarounds", "-o", "network.net.xml"],
-                   cwd=folder, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if design.control != "signal":
-        return None
-    net = ET.parse(folder / "network.net.xml")
-    moves = {"l": "left", "L": "left", "r": "right", "R": "right"}
-    return {int(c.get("linkIndex")): (axis(c.get("from")[0]), moves.get(c.get("dir"), "straight"))
-            for c in net.findall("./connection[@tl='centre']")}
-
-
-def signal_phases(links, design):
-    """Each axis gets an optional protected left arrow, then its main green, then yellow."""
-    def state(rule):
-        return "".join(rule(*links[i]) for i in range(len(links)))
-
-    phases = []
-    for active, green in (("NS", design.ns_green), ("EW", design.ew_green)):
-        if design.turn_arrow:
-            # Lefts go first with priority; rights may slip through if clear.
-            phases.append((design.arrow_green, state(
-                lambda a, m: "r" if a != active else "G" if m == "left" else
-                             "g" if m == "right" else "r")))
-            phases.append((design.yellow, state(
-                lambda a, m: "r" if a != active else "y" if m == "left" else
-                             "g" if m == "right" else "r")))
-        # Main green: straight and right have priority, lefts yield to oncoming cars.
-        phases.append((green, state(lambda a, m: "r" if a != active else "g" if m == "left" else "G")))
-        phases.append((design.yellow, state(lambda a, m: "y" if a == active else "r")))
-    return phases
-
-
-def write_signal(folder, links, design):
-    logic = ET.Element("tlLogic", id="centre", type="static", programID="candidate", offset="0")
-    for duration, state in signal_phases(links, design):
-        ET.SubElement(logic, "phase", duration=str(duration), state=state)
-    extra = ET.Element("additional")
-    extra.append(logic)
-    write_xml(extra, folder / "signal.add.xml")
+        stats = ET.parse(folder / "statistics.xml")
+        trips = stats.find("vehicleTripStatistics")
+        arrived = int(trips.get("count"))
+        collisions = int(stats.find("safety").get("collisions"))
+        teleports = int(stats.find("teleports").get("total"))
+        # Travel time starts on insertion. Adding departure delay also counts
+        # cars that had to wait outside a congested network before entering.
+        seconds = float(trips.get("totalTravelTime")) + float(trips.get("totalDepartDelay"))
+        if arrived != CAR_COUNT or collisions or teleports:
+            score = float("inf")
+            reason = f"{CAR_COUNT-arrived} unfinished; {collisions} collisions; {teleports} teleports"
+        else:
+            score = seconds / CAR_COUNT
+            reason = ""
+        result = dict(score=score, arrived=arrived, collisions=collisions,
+                      teleports=teleports, reason=reason)
+    (folder / "metrics.json").write_text(json.dumps(saved_metrics(result), indent=2), encoding="utf-8")
+    return result
 
 
 def make_traffic(path, seed):
-    """Draw a fixed set of trips. Each candidate faces exactly the same drivers."""
+    """Create synthetic (departure time, origin, destination) trips, once per seed."""
+    if CAR_COUNT < 1 or ARRIVAL_WINDOW <= 0 or not 0 <= EAST_WEST_SHARE <= 1:
+        raise ValueError("Use positive car count/window and an E/W share in [0,1].")
     rng = random.Random(seed)
     trips = ET.Element("routes")
-    departures = sorted(rng.uniform(0, ARRIVAL_WINDOW) for _ in range(CAR_COUNT))
-    for i, depart in enumerate(departures):
-        approach = rng.choice("EW" if rng.random() < EAST_WEST_SHARE else "NS")
-        turn = rng.choices([1, 2, 3], weights=[15, 70, 15])[0]
-        ET.SubElement(trips, "trip", {"id": f"car{i}", "depart": f"{depart:.2f}",
-                                      "departLane": "best", "from": approach + "_in",
-                                      "to": exit_arm(approach, turn) + "_out"})
+    ET.SubElement(trips, "vType", id="car", vClass="passenger", length="5",
+                  minGap="2.5", accel="2.6", decel="4.5", sigma="0.5")
+    times = sorted(rng.uniform(0, ARRIVAL_WINDOW) for _ in range(CAR_COUNT))
+    for i, depart in enumerate(times):
+        origin = rng.choice("EW" if rng.random() < EAST_WEST_SHARE else "NS")
+        turn = rng.choices(["left", "straight", "right"], weights=LEFT_STRAIGHT_RIGHT)[0]
+        exits = {"left": LEFT_EXIT, "straight": OPPOSITE, "right": RIGHT_EXIT}
+        destination = exits[turn][origin]
+        ET.SubElement(trips, "trip", id=f"car{i}", type="car", depart=f"{depart:.3f}",
+                      **{"from": origin + "_in", "to": destination + "_out", "departLane": "best"})
     write_xml(trips, path)
+    return Path(path).resolve()
 
 
-def scenario_args(traffic, seed, signal):
-    args = ["-n", "network.net.xml", "-r", str(traffic), "--seed", str(seed),
-            "--time-to-teleport", "-1"]
-    return args + (["-a", "signal.add.xml"] if signal else [])
+def write_configuration(network, signal, traffic, seed, folder):
+    """Save a replayable SUMO configuration, including incident checks."""
+    root = ET.Element("configuration")
+    inputs = ET.SubElement(root, "input")
+    for name, path in [("net-file", network), ("additional-files", signal), ("route-files", traffic)]:
+        ET.SubElement(inputs, name, value=str(Path(path).resolve()))
+    timing = ET.SubElement(root, "time")
+    ET.SubElement(timing, "end", value=str(ARRIVAL_WINDOW + DRAIN_SECONDS))
+    ET.SubElement(timing, "step-length", value="0.2")
+    processing = ET.SubElement(root, "processing")
+    ET.SubElement(processing, "time-to-teleport", value="-1")
+    ET.SubElement(processing, "collision.check-junctions", value="true")
+    randomness = ET.SubElement(root, "random_number")
+    ET.SubElement(randomness, "seed", value=str(seed))
+    path = folder / "scenario.sumocfg"
+    write_xml(root, path)
+    return path
 
 
-def score(network, design, traffic, seed):
-    """Minimize delay per car: time lost to the junction plus time waiting to depart."""
-    folder, links = network
-    if links is not None:
-        write_signal(folder, links, design)
-    subprocess.run(["sumo", *scenario_args(traffic, seed, links is not None), "--no-step-log",
-                    "--no-warnings", "--end", str(ARRIVAL_WINDOW + 3600),
-                    "--duration-log.statistics", "--statistic-output", "result.xml"],
-                   cwd=folder, check=True, stdout=subprocess.DEVNULL)
-    stats = ET.parse(folder / "result.xml")
-    trips = stats.find("vehicleTripStatistics")
-    if int(trips.get("count")) != CAR_COUNT or int(stats.find("teleports").get("total")):
-        return math.inf  # incomplete runs cannot win by omitting delayed cars
-    return float(trips.get("timeLoss")) + float(trips.get("departDelay"))
+def saved_metrics(result):
+    """Use JSON null for infeasible scores; JSON does not support infinity."""
+    return {**result, "score": result["score"] if math.isfinite(result["score"]) else None}
 
 
-def money(amount):
-    return f"${amount:,.0f}"
+def experiment_settings():
+    return dict(cars=CAR_COUNT, arrival_window=ARRIVAL_WINDOW, east_west_share=EAST_WEST_SHARE,
+                left_straight_right=LEFT_STRAIGHT_RIGHT, speed_limits_kmh=SPEED_LIMITS_KMH,
+                train_seed=TRAIN_SEED, test_seed=TEST_SEED, drain_seconds=DRAIN_SECONDS)
 
 
-def run_experiment(search, baseline, *, value_weight, budget, view=False):
-    """Prepare SUMO, pass a one-argument fitness function to the EA, and test its winner."""
-    programs = ["sumo", "netconvert"] + (["sumo-gui"] if view else [])
-    for program in programs:
-        if not shutil.which(program):
-            raise SystemExit(f"Cannot find {program}. Add SUMO's bin folder to PATH and restart VS Code.")
+def show_simulation(config):
+    subprocess.run([executable("sumo-gui"), "-c", str(config), "--start", "--delay", "30"], check=True)
 
-    with TemporaryDirectory(prefix="intersection_ea_") as workdir:
-        folder = Path(workdir)
-        traffic = {"train": (folder / "train.rou.xml", TRAIN_SEED),
-                   "test": (folder / "test.rou.xml", TEST_SEED)}
-        for path, seed in traffic.values():
-            make_traffic(path, seed)
 
-        networks = {}
+# --- Road geometry (SUMO implementation details) ---
+RIGHT_EXIT = dict(N="W", E="N", S="E", W="S")
+LEFT_EXIT = {value: key for key, value in RIGHT_EXIT.items()}
+OPPOSITE = dict(N="S", E="W", S="N", W="E")
+VECTORS = dict(N=(0, 1), E=(1, 0), S=(0, -1), W=(-1, 0))
 
-        def network_for(design):
-            key = layout_key(design)
-            if key not in networks:
-                layout_folder = folder / f"layout{len(networks)}"
-                layout_folder.mkdir()
-                networks[key] = (layout_folder, build_network(layout_folder, design))
-            return networks[key]
 
-        @lru_cache(maxsize=None)
-        def delay(design, run="train"):
-            return score(network_for(design), design, *traffic[run])
+class InvalidDesign(ValueError):
+    pass
 
-        reference = delay(baseline)
-        if math.isinf(reference):
-            raise SystemExit("The baseline design cannot clear its traffic. Try a lighter demand.")
 
-        @lru_cache(maxsize=None)
-        def fitness(design):
-            return value_score(delay(design), reference, total_cost(design), budget, value_weight)
+def build_roads(plan):
+    """Translate the 14 genes into roads, lane connections and timing settings."""
+    speeds = SPEED_LIMITS_KMH
+    if set(speeds) != set(ARMS) or any(not 20 <= v <= 80 for v in speeds.values()):
+        raise ValueError("Provide a speed in 20..80 km/h for every origin arm")
+    nodes = {"centre": dict(position=[0, 0], control="signal", radius=6)}
+    roads, movements, chains = {}, [], {}
 
-        print(f"{CAR_COUNT} trips per run; {EAST_WEST_SHARE:.0%} expected to enter from E/W.\n"
-              f"Budget {money(budget)}, value weight {value_weight:.2f} "
-              f"(0 = traffic only, 1 = cost only). Lower score wins.\n"
-              f"Baseline: {describe(baseline)} | {money(total_cost(baseline))} | "
-              f"delay {reference:.2f}s per car\n")
-        winner = search(fitness)
-        if math.isinf(delay(winner)):
-            raise SystemExit("No design cleared all scheduled trips. Try a lighter demand.")
+    def road(name, start, end, lanes, arm, curve=False, length=None, extra_offset=0):
+        first, last = nodes[start]["position"], nodes[end]["position"]
+        if curve:
+            control = [0.55 * (a + b) for a, b in zip(first, last)]
+            shape = [
+                [
+                    (1 - t) ** 2 * first[i]
+                    + 2 * (1 - t) * t * control[i]
+                    + t * t * last[i]
+                    for i in range(2)
+                ]
+                for t in [j / 12 for j in range(13)]
+            ]
+        else:
+            dx, dy = last[0] - first[0], last[1] - first[1]
+            d = math.hypot(dx, dy)
+            offset = 2 + lanes * 3.2 / 2 + extra_offset
+            shift = (offset * dy / d, -offset * dx / d)
+            shape = [[p[i] + shift[i] for i in range(2)] for p in (first, last)]
+        roads[name] = dict(
+            start=start,
+            end=end,
+            lanes=lanes,
+            width=3.2,
+            speed=min(8.3, speeds[arm] / 3.6) if curve else speeds[arm] / 3.6,
+            priority=1 if curve else 3,
+            shape=shape,
+            arm=arm,
+        )
+        if length is not None:
+            roads[name]["length"] = length
 
-        print(f"\n{delay.cache_info().misses} simulations across {len(networks)} road layouts.")
-        print("Delay = seconds lost per car (training traffic / fresh traffic)")
-        print(f"{'Design':12s} {'Cost':>12s} {'vs budget':>10s} {'Training':>9s} {'Fresh':>9s} {'Score':>7s}")
-        for label, design in [("Baseline", baseline), ("EA winner", winner)]:
-            cost = total_cost(design)
-            print(f"{label:12s} {money(cost):>12s} {(cost - budget) / budget:>+10.0%} "
-                  f"{delay(design):9.2f} {delay(design, 'test'):9.2f} {fitness(design):7.3f}")
-        print(f"\nWinner: {describe(winner)}")
-        for item, price in cost_breakdown(winner).items():
-            print(f"  {item:20s} {money(price):>12s}")
-        print(f"  {'Total':20s} {money(total_cost(winner)):>12s}")
+    def connect(first, second, pairs):
+        for a, b in pairs:
+            movements.append(
+                dict(from_edge=first, to_edge=second, from_lane=a, to_lane=b)
+            )
 
-        if view:
-            layout_folder, links = network_for(winner)
-            if links is not None:
-                write_signal(layout_folder, links, winner)
-            subprocess.run(["sumo-gui", *scenario_args(traffic["test"][0], TEST_SEED, links is not None),
-                            "--start", "--delay", "30"], cwd=layout_folder, check=True)
+    for arm in ARMS:
+        axis = "ns" if arm in "NS" else "ew"
+        pocket = plan["pocket_" + axis]
+        # 30 m graphical allowance for the central junction. Explicit edge
+        # lengths below make the added storage sum to the requested metres.
+        start = pocket + 30
+        gate = 150 if not pocket or abs(start - 150) >= 70 else start + 70
+        points = [(1500, arm), (gate, arm + "_gate"), (0, "centre")]
+        if pocket:
+            points.append((start, arm + "_pocket"))
+        points.sort(reverse=True)
+        x, y = VECTORS[arm]
+        for distance, name in points[:-1]:
+            nodes[name] = dict(
+                position=[distance * x, distance * y],
+                control="priority",
+                radius=(
+                    15
+                    if name.endswith("_pocket")
+                    else 5 if name.endswith("_gate") else 0
+                ),
+            )
+        chains[arm] = points
+
+    for arm in ARMS:
+        axis = "ns" if arm in "NS" else "ew"
+        n, pocket = plan["lanes_" + axis], plan["pocket_" + axis]
+        points = chains[arm]
+        incoming, outgoing = [], []
+        for i, ((d1, a), (d2, b)) in enumerate(zip(points, points[1:])):
+            inside = pocket > 0 and d1 <= pocket + 30
+            name = (
+                arm + "_in"
+                if i == 0
+                else (arm + "_to_centre" if b == "centre" else arm + f"_in_{i}")
+            )
+            exit_name = (
+                arm + "_out"
+                if i == 0
+                else (arm + "_from_centre" if b == "centre" else arm + f"_out_{i}")
+            )
+            # 'length' is a documented SUMO simulation length, distinct from drawing.
+            length = d1 - d2 - (30 if b == "centre" else 0) if inside else None
+            road(
+                name,
+                a,
+                b,
+                n + int(inside),
+                arm,
+                length=length,
+                extra_offset=3.2 if pocket and not inside else 0,
+            )
+            road(exit_name, b, a, n, OPPOSITE[arm])
+            incoming.append(name)
+            outgoing.append(exit_name)
+        for i in range(len(incoming) - 1):
+            na, nb = roads[incoming[i]]["lanes"], roads[incoming[i + 1]]["lanes"]
+            pairs = [(j, j) for j in range(na)]
+            if nb > na:
+                pairs.append((na - 1, nb - 1))
+            connect(incoming[i], incoming[i + 1], pairs)
+            connect(outgoing[i + 1], outgoing[i], [(j, j) for j in range(n)])
+        gate_index = next(
+            i for i, (_, node) in enumerate(points) if node == arm + "_gate"
+        )
+        chains[arm] = dict(incoming=incoming, outgoing=outgoing, gate_index=gate_index)
+
+    for arm in ARMS:
+        chain = chains[arm]
+        if plan["bypass_" + arm.lower()]:
+            dest = RIGHT_EXIT[arm]
+            name = arm + "_bypass"
+            road(name, arm + "_gate", dest + "_gate", 1, arm, curve=True)
+            connect(chain["incoming"][chain["gate_index"] - 1], name, [(0, 0)])
+            other = chains[dest]
+            connect(name, other["outgoing"][other["gate_index"] - 1], [(0, 0)])
+        axis = "ns" if arm in "NS" else "ew"
+        n = plan["lanes_" + axis]
+        inc = chain["incoming"][-1]
+        for turn, dest in [
+            ("right", RIGHT_EXIT[arm]),
+            ("straight", OPPOSITE[arm]),
+            ("left", LEFT_EXIT[arm]),
+        ]:
+            out = chains[dest]["outgoing"][-1]
+            pairs = (
+                [(0, 0)]
+                if turn == "right"
+                else (
+                    [(roads[inc]["lanes"] - 1, roads[out]["lanes"] - 1)]
+                    if turn == "left"
+                    else [(j, j) for j in range(n)]
+                )
+            )
+            connect(inc, out, pairs)
+            for movement in movements[-len(pairs) :]:
+                movement["turn"] = turn
+    # Dormant arrow genes do not change the phenotype when a pocket is absent.
+    settings = {}
+    for axis in ("ns", "ew"):
+        floor = max(3, 1 + max(speeds[a] for a in axis.upper()) / 3.6 / (2 * 3))
+        settings[axis] = dict(
+            green=plan["green_" + axis],
+            left=plan["left_green_" + axis] if plan["pocket_" + axis] else 0,
+            yellow=round(max(plan["yellow_" + axis], floor), 3),
+        )
+    return dict(
+        nodes=nodes, roads=roads, movements=movements, signals={"centre": settings}
+    )
+
+# --- XML and network compilation ---
+def write_xml(root, path):
+    ET.indent(root)
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def executable(name):
+    found = shutil.which(name)
+    suffix = ".exe" if os.name == "nt" else ""
+    candidate = Path(os.environ.get("SUMO_HOME", "")) / "bin" / (name + suffix)
+    if candidate.is_file():
+        return str(candidate.resolve())
+    try:
+        import sumo
+
+        candidate = Path(sumo.__file__).parent / "bin" / (name + suffix)
+        if candidate.is_file():
+            return str(candidate)
+    except ImportError:
+        pass
+    if found:
+        return found
+    raise RuntimeError(
+        f"Cannot find {name}. Add SUMO's bin folder to PATH and restart VS Code."
+    )
+
+
+def run_program(command, log, timeout=120):
+    """Save diagnostics; infrastructure errors should be visible to the user."""
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    log.write_text(result.stdout + result.stderr, encoding="utf-8")
+    if result.returncode:
+        raise RuntimeError(
+            f"{Path(command[0]).name} failed. See {log}\n{result.stderr[-1500:]}"
+        )
+
+
+def compile_network(graph, folder, netconvert):
+    folder.mkdir(parents=True, exist_ok=True)
+    nodes, roads = graph["nodes"], graph["roads"]
+    xml_nodes, xml_roads, xml_connections = (
+        ET.Element("nodes"),
+        ET.Element("edges"),
+        ET.Element("connections"),
+    )
+    for name, node in nodes.items():
+        x, y = node["position"]
+        control = {
+            "signal": "traffic_light",
+            "priority": "priority",
+            "stop": "allway_stop",
+        }[node["control"]]
+        ET.SubElement(
+            xml_nodes,
+            "node",
+            id=name,
+            x=str(x),
+            y=str(y),
+            type=control,
+            radius=str(node["radius"]),
+        )
+    for name, road in roads.items():
+        ET.SubElement(
+            xml_roads,
+            "edge",
+            {
+                **({"length": str(road["length"])} if "length" in road else {}),
+                "id": name,
+                "from": road["start"],
+                "to": road["end"],
+                "numLanes": str(road["lanes"]),
+                "speed": str(road["speed"]),
+                "priority": str(road["priority"]),
+                "width": str(road["width"]),
+                "spreadType": "center",
+                "shape": " ".join(f"{x:.4f},{y:.4f}" for x, y in road["shape"]),
+            },
+        )
+    expected = {
+        (m["from_edge"], m["to_edge"], m["from_lane"], m["to_lane"])
+        for m in graph["movements"]
+    }
+    road_pairs = {(first, second) for first, second, _, _ in expected}
+    # Explicitly forbid unlisted movements, including boundary turnarounds.
+    for first, road in roads.items():
+        for second, following in roads.items():
+            if road["end"] == following["start"] and (first, second) not in road_pairs:
+                ET.SubElement(xml_connections, "delete", {"from": first, "to": second})
+    for first, second, first_lane, second_lane in sorted(expected):
+        ET.SubElement(
+            xml_connections,
+            "connection",
+            {
+                "from": first,
+                "to": second,
+                "fromLane": str(first_lane),
+                "toLane": str(second_lane),
+            },
+        )
+    for root, name in [
+        (xml_nodes, "nodes.xml"),
+        (xml_roads, "roads.xml"),
+        (xml_connections, "movements.xml"),
+    ]:
+        write_xml(root, folder / name)
+    network = folder / "network.net.xml"
+    run_program(
+        [
+            netconvert,
+            "-n",
+            str(folder / "nodes.xml"),
+            "-e",
+            str(folder / "roads.xml"),
+            "-x",
+            str(folder / "movements.xml"),
+            "--no-turnarounds",
+            "-o",
+            str(network),
+        ],
+        folder / "build.log",
+    )
+    compiled = ET.parse(network)
+    actual = {
+        (
+            link.get("from"),
+            link.get("to"),
+            int(link.get("fromLane")),
+            int(link.get("toLane")),
+        )
+        for link in compiled.findall("connection")
+        if link.get("from") in roads and link.get("to") in roads
+    }
+    if actual != expected:
+        raise InvalidDesign(
+            f"Compiled lane movements differ. Missing {expected-actual}, extra {actual-expected}"
+        )
+    for edge in compiled.findall("edge"):
+        if edge.get("id") in roads and any(
+            float(lane.get("length")) < 5 for lane in edge.findall("lane")
+        ):
+            raise InvalidDesign(
+                "Junction geometry consumes a road segment " + edge.get("id")
+            )
+    return network
+
+
+
+# --- Signal phases and conflict checks ---
+def signal_phases(graph, compiled, junction, settings):
+    links = compiled.findall(f"./connection[@tl='{junction}']")
+    node = compiled.find(f"./junction[@id='{junction}']")
+    internal = node.get("intLanes").split()
+    requests = {int(r.get("index")): r for r in node.findall("request")}
+    mapping = {
+        (m["from_edge"], m["to_edge"], m["from_lane"], m["to_lane"]): m
+        for m in graph["movements"]
+    }
+    records = {}
+    for link in links:
+        via, visited = link.get("via"), set()
+        while via not in internal and via not in visited:
+            visited.add(via)
+            edge, lane = via.rsplit("_", 1)
+            nxt = compiled.find(f"./connection[@from='{edge}'][@fromLane='{lane}']")
+            if nxt is None or not nxt.get("via"):
+                break
+            via = nxt.get("via")
+        if via not in internal:
+            raise InvalidDesign("Cannot resolve TLS conflict indices")
+        key = (
+            link.get("from"),
+            link.get("to"),
+            int(link.get("fromLane")),
+            int(link.get("toLane")),
+        )
+        records[int(link.get("linkIndex"))] = dict(
+            request=internal.index(via),
+            arm=graph["roads"][link.get("from")]["arm"],
+            turn=mapping[key]["turn"],
+        )
+
+    def bit(a, b, field):
+        return (
+            requests[records[a]["request"]].get(field)[-(records[b]["request"] + 1)]
+            == "1"
+        )
+
+    def conflict(a, b):
+        return bit(a, b, "foes") or bit(b, a, "foes")
+
+    phases = []
+    for axis in ("ns", "ew"):
+        selected = {i: r for i, r in records.items() if r["arm"] in axis.upper()}
+        left = {i: "G" for i, r in selected.items() if r["turn"] == "left"}
+        if settings[axis]["left"]:
+            indices = list(left)
+            groups = (
+                [left]
+                if not any(
+                    conflict(a, b)
+                    for p, a in enumerate(indices)
+                    for b in indices[p + 1 :]
+                )
+                else [
+                    {
+                        i: "G"
+                        for i, r in selected.items()
+                        if r["turn"] == "left" and r["arm"] == arm
+                    }
+                    for arm in axis.upper()
+                ]
+            )
+            for group in groups:
+                phases.append(
+                    dict(
+                        name=axis + "_left_" + str(len(phases)),
+                        active=group,
+                        duration=settings[axis]["left"],
+                        yellow=settings[axis]["yellow"],
+                    )
+                )
+        active = {
+            i: ("g" if r["turn"] == "left" else "G")
+            for i, r in selected.items()
+            if r["turn"] != "left" or not settings[axis]["left"]
+        }
+        for i, state in active.items():
+            if state == "g":
+                for j, other in active.items():
+                    if other == "G" and conflict(i, j) and not bit(i, j, "response"):
+                        raise InvalidDesign(
+                            "Permissive left lacks underlying yield priority"
+                        )
+        phases.append(
+            dict(
+                name=axis + "_main",
+                active=active,
+                duration=settings[axis]["green"],
+                yellow=settings[axis]["yellow"],
+            )
+        )
+    # Never silently grant simultaneous priority to conflicting movements.
+    for phase in phases:
+        priority = [i for i, s in phase["active"].items() if s == "G"]
+        for pos, a in enumerate(priority):
+            if any(conflict(a, b) for b in priority[pos + 1 :]):
+                raise InvalidDesign("Conflicting protected greens in " + phase["name"])
+    covered = set().union(*(p["active"] for p in phases))
+    if covered != set(records):
+        raise InvalidDesign("Some movements have no green")
+    return phases, max(records) + 1
+
+
+def write_signals(graph, network, folder):
+    compiled = ET.parse(network)
+    extra = ET.Element("additional")
+    audit = {}
+    for junction, settings in graph["signals"].items():
+        phases, count = signal_phases(graph, compiled, junction, settings)
+        logic = ET.SubElement(
+            extra,
+            "tlLogic",
+            id=junction,
+            type="static",
+            programID="candidate",
+            offset="0",
+        )
+        for phase in phases:
+            green, yellow = ["r"] * count, ["r"] * count
+            for i, state in phase["active"].items():
+                green[i], yellow[i] = state, "y"
+            ET.SubElement(
+                logic,
+                "phase",
+                duration=str(phase["duration"]),
+                state="".join(green),
+                name=phase["name"],
+            )
+            ET.SubElement(
+                logic, "phase", duration=str(phase["yellow"]), state="".join(yellow)
+            )
+            ET.SubElement(logic, "phase", duration="3", state="r" * count)
+        audit[junction] = phases
+    path = folder / "signals.add.xml"
+    ET.indent(extra)
+    ET.ElementTree(extra).write(path, encoding="utf-8", xml_declaration=True)
+    (folder / "phase_audit.json").write_text(json.dumps(audit, indent=2))
+    return path
+
+
+def main():
+    # Only this standalone entry point imports the EA's representation validator.
+    # The simulation/evaluation functions above do not call any EA operators.
+    from intersection_ea import BASELINE, validate
+
+    parser = argparse.ArgumentParser(description="Run SUMO without running the EA")
+    parser.add_argument("--plan", type=Path, help="Saved JSON genome; default: BASELINE")
+    parser.add_argument("--view", action="store_true", help="Open this simulation in SUMO GUI")
+    args = parser.parse_args()
+    plan = validate(json.loads(args.plan.read_text()) if args.plan else BASELINE)
+    output = Path("results").resolve()
+    output.mkdir(exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix="simulation_", dir=output))
+    traffic = make_traffic(folder / "traffic.rou.xml", TEST_SEED)
+    result = run_simulation(plan, folder, traffic, TEST_SEED)
+    print(f"Mean journey: {result['score']:.2f}s; arrived {result['arrived']}/{CAR_COUNT}")
+    print(result["reason"] or "Complete, without collisions or teleports.")
+    print("Results:", folder)
+    if args.view and (folder / "scenario.sumocfg").exists():
+        show_simulation(folder / "scenario.sumocfg")
+
+
+if __name__ == "__main__":
+    main()

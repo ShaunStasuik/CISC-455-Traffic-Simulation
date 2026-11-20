@@ -1,0 +1,16 @@
+{
+  "pocket_ns": 0,
+  "pocket_ew": 0,
+  "left_green_ns": 18,
+  "left_green_ew": 0,
+  "lanes_ns": 1,
+  "lanes_ew": 1,
+  "bypass_n": false,
+  "bypass_e": false,
+  "bypass_s": false,
+  "bypass_w": false,
+  "green_ns": 15,
+  "green_ew": 42,
+  "yellow_ns": 4,
+  "yellow_ew": 4
+}
