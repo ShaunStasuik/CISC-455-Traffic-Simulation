@@ -321,7 +321,7 @@ def evolve(evaluate, population_size=POPULATION_SIZE, generations=GENERATIONS,
 # 6. USER DECISION. Weight is NOT used in NSGA-II ranking or variation.
 # Fixed scales that turn seconds and dollars into comparable numbers for the preference.
 # 60 s of delay per car and $1,000,000 of construction each count as "1.0".
-TIME_REFERENCE = 60.0
+TIME_REFERENCE = 20.0
 COST_REFERENCE = 1_000_000.0
 
 
